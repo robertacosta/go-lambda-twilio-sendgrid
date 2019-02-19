@@ -1,0 +1,14 @@
+AWSTemplateFormatVersion : '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Twilio EV
+Resources:
+  ev:
+    Type: AWS::Serverless::Function
+    Properties:
+      Runtime: go1.x
+      Handler: ev
+      CodeUri: .
+      Timeout: 5
+      Environment:
+        Variables:
+          EV_SENDGRID_API_KEY: "API_KEY"
