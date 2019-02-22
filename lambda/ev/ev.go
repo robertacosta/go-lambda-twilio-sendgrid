@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"time"
-
 	"net/url"
+	"strings"
+	"time"
 
 	"github.com/afex/hystrix-go/hystrix"
 	"github.com/aws/aws-lambda-go/lambda"
@@ -17,9 +17,16 @@ import (
 	"github.com/robertacosta/go-lambda-twilio-sendgrid/model"
 )
 
+const (
+	Invalid = "Invalid"
+)
+
 type Cfg struct {
 	// API Keys
 	SendGridAPIKey string `envconfig:"sendgrid_api_key" default:"api-key"`
+
+	// Contacts
+	ContactListID string `envconfig:"contact_list_id" default:"contact-list-id"`
 }
 
 func main() {
@@ -29,14 +36,15 @@ func main() {
 		log.Fatalf("error getting config: %s\n", err)
 	}
 
-	hystrixScoringConfig := hystrix.CommandConfig{
-		Timeout:               2000, // Timeout request after 2 sec
+	//
+	hystrixEmailValidationConfig := hystrix.CommandConfig{
+		Timeout:               5000, // Timeout request after 5 sec
 		MaxConcurrentRequests: 100,  // Bulk head, max requests that can be concurrently running, all others rejected
 		SleepWindow:           5000, // If circuit opens, try to close every 5 sec
 		ErrorPercentThreshold: 50,   // If over 50% of the requests return an error, open circuit
 	}
-	emailValidator := sendgrid.NewEmailValidation(cfg.SendGridAPIKey, hystrixScoringConfig)
-	emailValidatorTimeDuration := time.Duration(2000) * time.Millisecond
+	emailValidator := sendgrid.NewEmailValidation(cfg.SendGridAPIKey, hystrixEmailValidationConfig)
+	emailValidatorTimeDuration := time.Duration(5000) * time.Millisecond
 	emailValidatorHttpClient := &http.Client{
 		Timeout: emailValidatorTimeDuration,
 		Transport: &http.Transport{
@@ -45,8 +53,25 @@ func main() {
 	}
 	emailValidator.SetHttpClient(emailValidatorHttpClient)
 
+	hystrixContactConfig := hystrix.CommandConfig{
+		Timeout:               5000, // Timeout request after 5 sec
+		MaxConcurrentRequests: 100,  // Bulk head, max requests that can be concurrently running, all others rejected
+		SleepWindow:           5000, // If circuit opens, try to close every 5 sec
+		ErrorPercentThreshold: 50,   // If over 50% of the requests return an error, open circuit
+	}
+	contact := sendgrid.NewContact(cfg.ContactListID, cfg.SendGridAPIKey, hystrixContactConfig)
+	contactTimeDuration := time.Duration(5000) * time.Millisecond
+	contactHttpClient := &http.Client{
+		Timeout: contactTimeDuration,
+		Transport: &http.Transport{
+			TLSHandshakeTimeout: contactTimeDuration,
+		},
+	}
+	contact.SetHttpClient(contactHttpClient)
+
 	ev := EV{
 		emailValidator: emailValidator,
+		contactAdder:   contact,
 	}
 
 	lambda.Start(ev.Handler)
@@ -56,6 +81,7 @@ type EV struct {
 	cfg Cfg
 
 	emailValidator sendgrid.Validator
+	contactAdder   sendgrid.Adder
 }
 
 func (e *EV) Handler(ctx context.Context, request model.TwilioRequest) (string, error) {
@@ -63,15 +89,41 @@ func (e *EV) Handler(ctx context.Context, request model.TwilioRequest) (string, 
 
 	email, err := url.QueryUnescape(request.Body)
 	if len(email) < 1 || err != nil {
-		return wrapWithTwilioReponse("Please provide an email"), fmt.Errorf("email address was not provided")
+		return wrapWithTwilioReponse("Please provide an email"), nil
 	}
 
 	evResponse, err := e.emailValidator.Validate(email)
 	if err != nil {
-		return wrapWithTwilioReponse("Could not validate email"), fmt.Errorf("email validation failed")
+		return wrapWithTwilioReponse("Could not validate email"), nil
 	}
 
-	return wrapWithTwilioReponse(fmt.Sprintf("Score: %f", evResponse.Result.Score)), nil
+	// If result is invalid return that instead of adding to list
+	evResult := evResponse.Result
+	if evResult.Result == Invalid {
+		errMessage := "Email likely invalid."
+		if evResult.Suggestion != "" {
+			errMessage += fmt.Sprintf(" Consider using %s@%s", evResult.Local, evResult.Suggestion)
+		}
+		if len(evResult.Reasons) > 0 {
+			errMessage += " Reasons include: "
+			for _, reason := range evResult.Reasons {
+				errMessage += fmt.Sprintf("%s, ", reason)
+			}
+			errMessage = strings.TrimSuffix(errMessage, ", ")
+		}
+
+		return wrapWithTwilioReponse(errMessage), nil
+	}
+
+	// If the result is not invalid, add to contact list
+	err = e.contactAdder.Add(email)
+	if err != nil {
+		return wrapWithTwilioReponse("Could not add email to contact list"), nil
+	}
+
+	responseMessage := fmt.Sprintf("Email added to contact list. It was considered %s with a score of %f", evResult.Result, evResult.Score)
+
+	return wrapWithTwilioReponse(responseMessage), nil
 
 }
 

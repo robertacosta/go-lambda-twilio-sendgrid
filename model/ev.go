@@ -24,3 +24,12 @@ type EmailValidationResult struct {
 	Suggestion string   `json:"suggestion,omitempty"`
 	Reasons    []string `json:"reasons,omitempty"`
 }
+
+type ContactRequest struct {
+	ListIDs  []string  `json:"list_ids"`
+	Contacts []Contact `json:"contacts"`
+}
+
+type Contact struct {
+	Email string `json:"email"`
+}
